@@ -14,6 +14,7 @@ import argparse
 import os
 import time
 from contextlib import nullcontext
+from io import BytesIO
 from itertools import islice
 
 import cv2
@@ -216,6 +217,17 @@ def main(opt):
                         )
                         img = Image.fromarray(x_sample.astype(np.uint8))
                         st.image(img)
+
+                        buf = BytesIO()
+                        img.save(buf, format="PNG")
+                        byte_im = buf.getvalue()
+                        btn = st.download_button(
+                            label="Download image",
+                            data=byte_im,
+                            file_name="flower.png",
+                            mime="image/png",
+                        )
+
                         img = put_watermark(img, wm_encoder)
                         img.save(os.path.join(sample_path, f"{base_count:05}.png"))
                         base_count += 1
@@ -301,7 +313,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--n_iter",
         type=int,
-        default=2,
+        default=8,
         help="sample this often",
     )
     parser.add_argument(
@@ -331,7 +343,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--n_samples",
         type=int,
-        default=3,
+        default=1,
         help="how many samples to produce for each given prompt. A.k.a. batch size",
     )
     parser.add_argument(
