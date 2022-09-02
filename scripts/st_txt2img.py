@@ -11,17 +11,16 @@
 
 """
 import argparse
+import typing as tp
 from contextlib import nullcontext
 from io import BytesIO
-from itertools import islice
 
-import cv2
 import numpy as np
 import streamlit as st
 import torch
 from diffusers.pipelines.stable_diffusion.safety_checker import \
     StableDiffusionSafetyChecker
-from einops import rearrange
+from joblib.memory import Memory
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 from ldm.util import instantiate_from_config
@@ -38,11 +37,6 @@ safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
 safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
 
 
-def chunk(it, size):
-    it = iter(it)
-    return iter(lambda: tuple(islice(it, size)), ())
-
-
 def numpy_to_pil(images):
     """
     Convert a numpy image or a batch of images to a PIL image.
@@ -53,6 +47,31 @@ def numpy_to_pil(images):
     pil_images = [Image.fromarray(image) for image in images]
 
     return pil_images
+
+
+def load_replacement(x):
+    try:
+        hwc = x.shape
+        y = Image.open("assets/rick.jpeg").convert("RGB").resize((hwc[1], hwc[0]))
+        y = (np.array(y) / 255.0).astype(x.dtype)
+        assert y.shape == x.shape
+        return y
+    except Exception:
+        return x
+
+
+def check_safety(x_image):
+    safety_checker_input = safety_feature_extractor(
+        numpy_to_pil(x_image), return_tensors="pt"
+    )
+    x_checked_image, has_nsfw_concept = safety_checker(
+        images=x_image, clip_input=safety_checker_input.pixel_values
+    )
+    assert x_checked_image.shape[0] == len(has_nsfw_concept)
+    for i in range(len(has_nsfw_concept)):
+        if has_nsfw_concept[i]:
+            x_checked_image[i] = load_replacement(x_checked_image[i])
+    return x_checked_image, has_nsfw_concept
 
 
 def prepare_model(
@@ -82,126 +101,137 @@ def prepare_model(
     return model
 
 
-def put_watermark(img, wm_encoder=None):
-    if wm_encoder is not None:
-        img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        img = wm_encoder.encode(img, "dwtDct")
-        img = Image.fromarray(img[:, :, ::-1])
-    return img
+# NOTE(YL 09/02):: remember to clean up the cache if it gets too large
+mem = Memory(location="/tmp/stable_diffusion")
 
 
-def load_replacement(x):
-    try:
-        hwc = x.shape
-        y = Image.open("assets/rick.jpeg").convert("RGB").resize((hwc[1], hwc[0]))
-        y = (np.array(y) / 255.0).astype(x.dtype)
-        assert y.shape == x.shape
-        return y
-    except Exception:
-        return x
+@mem.cache(ignore=["model"])
+def gen_images(
+    model,
+    prompt: str,
+    batch_size: int,
+    n_iter: int,
+    H: int,
+    W: int,
+    C: int,
+    f: float,
+    scale: float,
+    fixed_code: bool,
+    plms: bool,
+    cuda: str,
+    seed: int,
+) -> tp.List[Image.Image]:
 
+    seed_everything(seed)
 
-def check_safety(x_image):
-    safety_checker_input = safety_feature_extractor(
-        numpy_to_pil(x_image), return_tensors="pt"
-    )
-    x_checked_image, has_nsfw_concept = safety_checker(
-        images=x_image, clip_input=safety_checker_input.pixel_values
-    )
-    assert x_checked_image.shape[0] == len(has_nsfw_concept)
-    for i in range(len(has_nsfw_concept)):
-        if has_nsfw_concept[i]:
-            x_checked_image[i] = load_replacement(x_checked_image[i])
-    return x_checked_image, has_nsfw_concept
+    device = torch.device("cuda" if cuda else "cpu")
+
+    if plms:
+        sampler = PLMSSampler(model)
+    else:
+        sampler = DDIMSampler(model)
+
+    data = [batch_size * [prompt]]
+    shape = [C, H // f, W // f]
+
+    start_code = None
+    if fixed_code:
+        start_code = torch.randn([batch_size, *shape], device=device)
+
+    gen_image_list = []
+    for n in trange(n_iter, desc="Sampling"):
+        for prompts in tqdm(data, desc="data"):
+
+            uc = None
+            if scale != 1.0:
+                uc = model.get_learned_conditioning(batch_size * [""])
+
+            c = model.get_learned_conditioning(prompts)
+            samples_ddim, _ = sampler.sample(
+                S=opt.ddim_steps,
+                conditioning=c,
+                batch_size=batch_size,
+                shape=shape,
+                verbose=False,
+                unconditional_guidance_scale=scale,
+                unconditional_conditioning=uc,
+                eta=opt.ddim_eta,
+                x_T=start_code,
+            )
+
+            x_samples_ddim = model.decode_first_stage(samples_ddim)
+            x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+            x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
+
+            x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
+
+            for x_sample in x_checked_image:
+                x_sample = 255.0 * x_sample
+                gen_image_list.append(x_sample.astype(np.uint8))
+
+    return gen_image_list
 
 
 def main(opt):
-
-    if opt.laion400m:
-        print("Falling back to LAION 400M model...")
-        opt.config = "configs/latent-diffusion/txt2img-1p4B-eval.yaml"
-        opt.ckpt = "models/ldm/text2img-large/model.ckpt"
-
-    seed_everything(opt.seed)
-
-    device = torch.device("cuda" if opt.cuda else "cpu")
 
     model = st.cache(prepare_model, allow_output_mutation=True)(
         f"{opt.config}", f"{opt.ckpt}", opt.cuda
     )
 
-    if opt.plms:
-        sampler = PLMSSampler(model)
-    else:
-        sampler = DDIMSampler(model)
-
-    batch_size = opt.n_samples
-    prompt = opt.prompt
-    assert prompt is not None
-    data = [batch_size * [prompt]]
-
-    start_code = None
-    if opt.fixed_code:
-        start_code = torch.randn(
-            [opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device
+    with st.sidebar.form("Params"):
+        prompt = st.text_area(
+            "Prompt", "Boston is a beautiful, grand, historic, sensible city."
         )
+        seed = st.number_input("Seed", min_value=0, max_value=1000000, value=42)
+
+        H = st.number_input("H", min_value=64, max_value=1024, value=512)
+        W = st.number_input("W", min_value=64, max_value=1024, value=512)
+
+        C = st.number_input("C", min_value=1, max_value=32, value=4)
+        f = st.number_input("f", min_value=1, max_value=16, value=8)
+        scale = st.number_input("Scale", min_value=0.0, max_value=10.0, value=7.5)
+
+        batch_size = st.number_input("Batch size", min_value=1, max_value=8, value=1)
+        n_iter = st.number_input(
+            "Number of iterations", min_value=1, max_value=100, value=2
+        )
+        fixed_code = st.checkbox("Fixed code", value=True)
+
+        st.form_submit_button()
 
     precision_scope = autocast if opt.precision == "autocast" else nullcontext
     with torch.no_grad(), precision_scope("cuda"), model.ema_scope():
-        for n in trange(opt.n_iter, desc="Sampling"):
-            for i_p, prompts in enumerate(tqdm(data, desc="data")):
+        gen_image_list = gen_images(
+            model,
+            prompt,
+            batch_size,
+            n_iter,
+            H,
+            W,
+            C,
+            f,
+            scale,
+            fixed_code,
+            opt.plms,
+            opt.cuda,
+            seed,
+        )
 
-                uc = None
-                if opt.scale != 1.0:
-                    uc = model.get_learned_conditioning(batch_size * [""])
+    for idx_img, img in enumerate(gen_image_list):
+        img = Image.fromarray(img)
+        st.image(img)
 
-                if isinstance(prompts, tuple):
-                    prompts = list(prompts)
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        byte_im = buf.getvalue()
 
-                c = model.get_learned_conditioning(prompts)
-                shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
-                samples_ddim, _ = sampler.sample(
-                    S=opt.ddim_steps,
-                    conditioning=c,
-                    batch_size=opt.n_samples,
-                    shape=shape,
-                    verbose=False,
-                    unconditional_guidance_scale=opt.scale,
-                    unconditional_conditioning=uc,
-                    eta=opt.ddim_eta,
-                    x_T=start_code,
-                )
-
-                x_samples_ddim = model.decode_first_stage(samples_ddim)
-                x_samples_ddim = torch.clamp(
-                    (x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0
-                )
-                x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy()
-
-                x_checked_image, has_nsfw_concept = check_safety(x_samples_ddim)
-
-                x_checked_image_torch = torch.from_numpy(x_checked_image).permute(
-                    0, 3, 1, 2
-                )
-
-                for i_x, x_sample in enumerate(x_checked_image_torch):
-                    x_sample = 255.0 * rearrange(
-                        x_sample.cpu().numpy(), "c h w -> h w c"
-                    )
-                    img = Image.fromarray(x_sample.astype(np.uint8))
-                    st.image(img)
-
-                    buf = BytesIO()
-                    img.save(buf, format="PNG")
-                    byte_im = buf.getvalue()
-
-                    filename = f"{n:04d}-{i_p:04d}-{i_x:04d}.png"
-                    btn = st.download_button(
-                        label="Download",
-                        data=byte_im,
-                        file_name=filename,
-                        mime="image/png",
-                    )
+        file_name = f"{idx_img:04d}.png"
+        btn = st.download_button(
+            label="Download",
+            data=byte_im,
+            file_name=file_name,
+            mime="image/png",
+        )
 
 
 if __name__ == "__main__":
@@ -232,57 +262,10 @@ if __name__ == "__main__":
         help="uses the LAION400M model",
     )
     parser.add_argument(
-        "--fixed_code",
-        action="store_true",
-        help="if enabled, uses the same starting code across samples ",
-    )
-    parser.add_argument(
         "--ddim_eta",
         type=float,
         default=0.0,
         help="ddim eta (eta=0.0 corresponds to deterministic sampling",
-    )
-    parser.add_argument(
-        "--n_iter",
-        type=int,
-        default=2,
-        help="sample this often",
-    )
-    parser.add_argument(
-        "--H",
-        type=int,
-        default=512,
-        help="image height, in pixel space",
-    )
-    parser.add_argument(
-        "--W",
-        type=int,
-        default=512,
-        help="image width, in pixel space",
-    )
-    parser.add_argument(
-        "--C",
-        type=int,
-        default=4,
-        help="latent channels",
-    )
-    parser.add_argument(
-        "--f",
-        type=int,
-        default=8,
-        help="downsampling factor",
-    )
-    parser.add_argument(
-        "--n_samples",
-        type=int,
-        default=1,
-        help="how many samples to produce for each given prompt. A.k.a. batch size",
-    )
-    parser.add_argument(
-        "--scale",
-        type=float,
-        default=7.5,
-        help="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
     )
     parser.add_argument(
         "--config",
@@ -297,12 +280,6 @@ if __name__ == "__main__":
         help="path to checkpoint of model",
     )
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="the seed (for reproducible sampling)",
-    )
-    parser.add_argument(
         "--precision",
         type=str,
         help="evaluate at this precision",
@@ -315,5 +292,10 @@ if __name__ == "__main__":
         help="use cuda",
     )
     opt = parser.parse_args()
+
+    if opt.laion400m:
+        print("Falling back to LAION 400M model...")
+        opt.config = "configs/latent-diffusion/txt2img-1p4B-eval.yaml"
+        opt.ckpt = "models/ldm/text2img-large/model.ckpt"
 
     main(opt)
