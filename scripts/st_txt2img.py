@@ -11,8 +11,6 @@
 
 """
 import argparse
-import os
-import time
 from contextlib import nullcontext
 from io import BytesIO
 from itertools import islice
@@ -24,7 +22,6 @@ import torch
 from diffusers.pipelines.stable_diffusion.safety_checker import \
     StableDiffusionSafetyChecker
 from einops import rearrange
-from imwatermark import WatermarkEncoder
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 from ldm.util import instantiate_from_config
@@ -32,7 +29,6 @@ from omegaconf import OmegaConf
 from PIL import Image
 from pytorch_lightning import seed_everything
 from torch import autocast
-from torchvision.utils import make_grid
 from tqdm import tqdm, trange
 from transformers import AutoFeatureExtractor
 
@@ -59,7 +55,9 @@ def numpy_to_pil(images):
     return pil_images
 
 
-def prepare_model(config_path: str, ckpt_path: str, verbose=False) -> torch.nn.Module:
+def prepare_model(
+    config_path: str, ckpt_path: str, cuda: bool, verbose=False
+) -> torch.nn.Module:
 
     config = OmegaConf.load(config_path)
 
@@ -77,9 +75,8 @@ def prepare_model(config_path: str, ckpt_path: str, verbose=False) -> torch.nn.M
         print("unexpected keys:")
         print(u)
 
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    device = torch.device("cuda" if cuda else "cpu")
     model = model.to(device)
-
     model.eval()
 
     return model
@@ -124,14 +121,13 @@ def main(opt):
         print("Falling back to LAION 400M model...")
         opt.config = "configs/latent-diffusion/txt2img-1p4B-eval.yaml"
         opt.ckpt = "models/ldm/text2img-large/model.ckpt"
-        opt.outdir = "outputs/txt2img-samples-laion400m"
 
     seed_everything(opt.seed)
 
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    device = torch.device("cuda" if opt.cuda else "cpu")
 
     model = st.cache(prepare_model, allow_output_mutation=True)(
-        f"{opt.config}", f"{opt.ckpt}"
+        f"{opt.config}", f"{opt.ckpt}", opt.cuda
     )
 
     if opt.plms:
@@ -139,33 +135,10 @@ def main(opt):
     else:
         sampler = DDIMSampler(model)
 
-    os.makedirs(opt.outdir, exist_ok=True)
-    outpath = opt.outdir
-
-    print(
-        "Creating invisible watermark encoder (see https://github.com/ShieldMnt/invisible-watermark)..."
-    )
-    wm = "StableDiffusionV1"
-    wm_encoder = WatermarkEncoder()
-    wm_encoder.set_watermark("bytes", wm.encode("utf-8"))
-
     batch_size = opt.n_samples
-    n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
-    if not opt.from_file:
-        prompt = opt.prompt
-        assert prompt is not None
-        data = [batch_size * [prompt]]
-
-    else:
-        print(f"reading prompts from {opt.from_file}")
-        with open(opt.from_file, "r") as f:
-            data = f.read().splitlines()
-            data = list(chunk(data, batch_size))
-
-    sample_path = os.path.join(outpath, "samples")
-    os.makedirs(sample_path, exist_ok=True)
-    base_count = len(os.listdir(sample_path))
-    grid_count = len(os.listdir(outpath)) - 1
+    prompt = opt.prompt
+    assert prompt is not None
+    data = [batch_size * [prompt]]
 
     start_code = None
     if opt.fixed_code:
@@ -175,15 +148,16 @@ def main(opt):
 
     precision_scope = autocast if opt.precision == "autocast" else nullcontext
     with torch.no_grad(), precision_scope("cuda"), model.ema_scope():
-        time.time()
-        all_samples = list()
         for n in trange(opt.n_iter, desc="Sampling"):
-            for prompts in tqdm(data, desc="data"):
+            for i_p, prompts in enumerate(tqdm(data, desc="data")):
+
                 uc = None
                 if opt.scale != 1.0:
                     uc = model.get_learned_conditioning(batch_size * [""])
+
                 if isinstance(prompts, tuple):
                     prompts = list(prompts)
+
                 c = model.get_learned_conditioning(prompts)
                 shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
                 samples_ddim, _ = sampler.sample(
@@ -210,49 +184,24 @@ def main(opt):
                     0, 3, 1, 2
                 )
 
-                if not opt.skip_save:
-                    for x_sample in x_checked_image_torch:
-                        x_sample = 255.0 * rearrange(
-                            x_sample.cpu().numpy(), "c h w -> h w c"
-                        )
-                        img = Image.fromarray(x_sample.astype(np.uint8))
-                        st.image(img)
+                for i_x, x_sample in enumerate(x_checked_image_torch):
+                    x_sample = 255.0 * rearrange(
+                        x_sample.cpu().numpy(), "c h w -> h w c"
+                    )
+                    img = Image.fromarray(x_sample.astype(np.uint8))
+                    st.image(img)
 
-                        buf = BytesIO()
-                        img.save(buf, format="PNG")
-                        byte_im = buf.getvalue()
-                        btn = st.download_button(
-                            label="Download image",
-                            data=byte_im,
-                            file_name="flower.png",
-                            mime="image/png",
-                        )
+                    buf = BytesIO()
+                    img.save(buf, format="PNG")
+                    byte_im = buf.getvalue()
 
-                        img = put_watermark(img, wm_encoder)
-                        img.save(os.path.join(sample_path, f"{base_count:05}.png"))
-                        base_count += 1
-
-                if not opt.skip_grid:
-                    all_samples.append(x_checked_image_torch)
-
-        if not opt.skip_grid:
-            # additionally, save as grid
-            grid = torch.stack(all_samples, 0)
-            grid = rearrange(grid, "n b c h w -> (n b) c h w")
-            grid = make_grid(grid, nrow=n_rows)
-
-            # to image
-            grid = 255.0 * rearrange(grid, "c h w -> h w c").cpu().numpy()
-            img = Image.fromarray(grid.astype(np.uint8))
-            img = put_watermark(img, wm_encoder)
-            img.save(os.path.join(outpath, f"grid-{grid_count:04}.png"))
-            grid_count += 1
-
-        time.time()
-
-    print(
-        f"Your samples are ready and waiting for you here: \n{outpath} \n" f" \nEnjoy."
-    )
+                    filename = f"{n:04d}-{i_p:04d}-{i_x:04d}.png"
+                    btn = st.download_button(
+                        label="Download",
+                        data=byte_im,
+                        file_name=filename,
+                        mime="image/png",
+                    )
 
 
 if __name__ == "__main__":
@@ -265,23 +214,6 @@ if __name__ == "__main__":
         nargs="?",
         default="a painting of a virus monster playing guitar",
         help="the prompt to render",
-    )
-    parser.add_argument(
-        "--outdir",
-        type=str,
-        nargs="?",
-        help="dir to write results to",
-        default="outputs/txt2img-samples",
-    )
-    parser.add_argument(
-        "--skip_grid",
-        action="store_true",
-        help="do not save a grid, only individual samples. Helpful when evaluating lots of samples",
-    )
-    parser.add_argument(
-        "--skip_save",
-        action="store_true",
-        help="do not save individual samples. For speed measurements.",
     )
     parser.add_argument(
         "--ddim_steps",
@@ -313,7 +245,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--n_iter",
         type=int,
-        default=8,
+        default=2,
         help="sample this often",
     )
     parser.add_argument(
@@ -347,21 +279,10 @@ if __name__ == "__main__":
         help="how many samples to produce for each given prompt. A.k.a. batch size",
     )
     parser.add_argument(
-        "--n_rows",
-        type=int,
-        default=0,
-        help="rows in the grid (default: n_samples)",
-    )
-    parser.add_argument(
         "--scale",
         type=float,
         default=7.5,
         help="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty))",
-    )
-    parser.add_argument(
-        "--from-file",
-        type=str,
-        help="if specified, load prompts from this file",
     )
     parser.add_argument(
         "--config",
@@ -387,6 +308,11 @@ if __name__ == "__main__":
         help="evaluate at this precision",
         choices=["full", "autocast"],
         default="autocast",
+    )
+    parser.add_argument(
+        "--cuda",
+        action="store_true",
+        help="use cuda",
     )
     opt = parser.parse_args()
 
