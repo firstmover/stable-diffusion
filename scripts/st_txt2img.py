@@ -18,18 +18,21 @@ from io import BytesIO
 import numpy as np
 import streamlit as st
 import torch
-from diffusers.pipelines.stable_diffusion.safety_checker import \
-    StableDiffusionSafetyChecker
 from joblib.memory import Memory
+from PIL import Image
+from torch import autocast
+from tqdm import tqdm, trange
+
+from diffusers.pipelines.stable_diffusion.safety_checker import (
+    StableDiffusionSafetyChecker,
+)
+from omegaconf import OmegaConf
+from pytorch_lightning import seed_everything
+from transformers import AutoFeatureExtractor
+
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 from ldm.util import instantiate_from_config
-from omegaconf import OmegaConf
-from PIL import Image
-from pytorch_lightning import seed_everything
-from torch import autocast
-from tqdm import tqdm, trange
-from transformers import AutoFeatureExtractor
 
 # load safety model
 safety_model_id = "CompVis/stable-diffusion-safety-checker"
@@ -108,6 +111,7 @@ mem = Memory(location="/tmp/stable_diffusion")
 @mem.cache(ignore=["model"])
 def gen_images(
     model,
+    model_hash: str,
     prompt: str,
     batch_size: int,
     n_iter: int,
@@ -193,9 +197,9 @@ def main(opt):
 
         batch_size = st.number_input("Batch size", min_value=1, max_value=8, value=1)
         n_iter = st.number_input(
-            "Number of iterations", min_value=1, max_value=100, value=2
+            "Number of iterations", min_value=1, max_value=100, value=4
         )
-        fixed_code = st.checkbox("Fixed code", value=True)
+        fixed_code = st.checkbox("Fixed code", value=False)
 
         st.form_submit_button()
 
@@ -203,6 +207,7 @@ def main(opt):
     with torch.no_grad(), precision_scope("cuda"), model.ema_scope():
         gen_image_list = gen_images(
             model,
+            f"{opt.config}-{opt.ckpt}",
             prompt,
             batch_size,
             n_iter,
@@ -217,16 +222,23 @@ def main(opt):
             seed,
         )
 
+    num_col = st.sidebar.number_input(
+        "Number of columns", min_value=1, max_value=10, value=2
+    )
+    col_list = st.columns(num_col)
+
     for idx_img, img in enumerate(gen_image_list):
         img = Image.fromarray(img)
-        st.image(img)
+
+        col = col_list[idx_img % num_col]
+        col.image(img)
 
         buf = BytesIO()
         img.save(buf, format="PNG")
         byte_im = buf.getvalue()
 
         file_name = f"{idx_img:04d}.png"
-        btn = st.download_button(
+        btn = col.download_button(
             label="Download",
             data=byte_im,
             file_name=file_name,
@@ -238,13 +250,6 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument(
-        "--prompt",
-        type=str,
-        nargs="?",
-        default="a painting of a virus monster playing guitar",
-        help="the prompt to render",
-    )
     parser.add_argument(
         "--ddim_steps",
         type=int,
