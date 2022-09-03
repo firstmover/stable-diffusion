@@ -4,18 +4,18 @@
 # Author : Yingcheng Liu
 # Email  : liuyc@mit.edu
 # Date   : 09/02/2022
-#
-# Distributed under terms of the MIT license.
 
 """
 
 """
 import argparse
+import os
 import typing as tp
 from contextlib import nullcontext
 from io import BytesIO
 
 import numpy as np
+import PIL
 import streamlit as st
 import torch
 from joblib.memory import Memory
@@ -26,6 +26,7 @@ from tqdm import tqdm, trange
 from diffusers.pipelines.stable_diffusion.safety_checker import (
     StableDiffusionSafetyChecker,
 )
+from einops import repeat
 from omegaconf import OmegaConf
 from pytorch_lightning import seed_everything
 from transformers import AutoFeatureExtractor
@@ -124,7 +125,7 @@ def gen_images(
     plms: bool,
     cuda: str,
     seed: int,
-) -> tp.List[Image.Image]:
+) -> tp.List[np.ndarray]:
 
     seed_everything(seed)
 
@@ -176,51 +177,184 @@ def gen_images(
     return gen_image_list
 
 
+def load_img(path):
+    image = Image.open(path).convert("RGB")
+    w, h = image.size
+    print(f"loaded input image of size ({w}, {h}) from {path}")
+    w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
+
+    # NOTE(YL 09/02):: update this
+    w = w // 2
+    h = h // 2
+
+    image = image.resize((w, h), resample=PIL.Image.LANCZOS)
+    image = np.array(image).astype(np.float32) / 255.0
+    image = image[None].transpose(0, 3, 1, 2)
+    image = torch.from_numpy(image)
+    return 2.0 * image - 1.0
+
+
+@mem.cache(ignore=["model"])
+def gen_images_cond_image(
+    model,
+    model_hash: str,
+    prompt: str,
+    batch_size: int,
+    n_iter: int,
+    scale: float,
+    plms: bool,
+    cuda: str,
+    seed: int,
+) -> tp.List[np.ndarray]:
+
+    seed_everything(seed)
+
+    device = torch.device("cuda" if cuda else "cpu")
+
+    if plms:
+        raise NotImplementedError("PLMS sampler not (yet) supported")
+        sampler = PLMSSampler(model)
+    else:
+        sampler = DDIMSampler(model)
+
+    data = [batch_size * [prompt]]
+
+    assert os.path.isfile(opt.init_img)
+    init_image = load_img(opt.init_img).to(device)
+    print("init_image.shape: {}".format(init_image.shape))
+    init_image = repeat(init_image, "1 ... -> b ...", b=batch_size)
+    init_latent = model.get_first_stage_encoding(
+        model.encode_first_stage(init_image)
+    )  # move to latent space
+
+    sampler.make_schedule(
+        ddim_num_steps=opt.ddim_steps, ddim_eta=opt.ddim_eta, verbose=False
+    )
+
+    assert 0.0 <= opt.strength <= 1.0, "can only work with strength in [0.0, 1.0]"
+    t_enc = int(opt.strength * opt.ddim_steps)
+    print(f"target t_enc is {t_enc} steps")
+
+    gen_image_list = []
+    for n in trange(n_iter, desc="Sampling"):
+        for prompts in tqdm(data, desc="data"):
+
+            uc = None
+            if scale != 1.0:
+                uc = model.get_learned_conditioning(batch_size * [""])
+
+            c = model.get_learned_conditioning(prompts)
+            # encode (scaled latent)
+            z_enc = sampler.stochastic_encode(
+                init_latent, torch.tensor([t_enc] * batch_size).to(device)
+            )
+            # decode it
+            samples = sampler.decode(
+                z_enc,
+                c,
+                t_enc,
+                unconditional_guidance_scale=scale,
+                unconditional_conditioning=uc,
+            )
+
+            x_samples = model.decode_first_stage(samples)
+            x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
+            x_samples = x_samples.cpu().permute(0, 2, 3, 1).numpy()
+
+            x_checked_image, has_nsfw_concept = check_safety(x_samples)
+
+            for x_sample in x_checked_image:
+                x_sample = 255.0 * x_sample
+                gen_image_list.append(x_sample.astype(np.uint8))
+
+    return gen_image_list
+
+
 def main(opt):
 
     model = st.cache(prepare_model, allow_output_mutation=True)(
         f"{opt.config}", f"{opt.ckpt}", opt.cuda
     )
 
-    with st.sidebar.form("Params"):
-        prompt = st.text_area(
-            "Prompt", "Boston is a beautiful, grand, historic, sensible city."
-        )
-        seed = st.number_input("Seed", min_value=0, max_value=1000000, value=42)
+    option_list = ["text2img", "img2img"]
+    option = st.sidebar.selectbox("option", option_list)
 
-        H = st.number_input("H", min_value=64, max_value=1024, value=512)
-        W = st.number_input("W", min_value=64, max_value=1024, value=512)
+    if option == "text2img":
 
-        C = st.number_input("C", min_value=1, max_value=32, value=4)
-        f = st.number_input("f", min_value=1, max_value=16, value=8)
-        scale = st.number_input("Scale", min_value=0.0, max_value=10.0, value=7.5)
+        with st.sidebar.form("Params"):
+            prompt = st.text_area(
+                "Prompt", "Boston is a beautiful, grand, historic, sensible city."
+            )
+            seed = st.number_input("Seed", min_value=0, max_value=1000000, value=42)
 
-        batch_size = st.number_input("Batch size", min_value=1, max_value=8, value=1)
-        n_iter = st.number_input(
-            "Number of iterations", min_value=1, max_value=100, value=4
-        )
-        fixed_code = st.checkbox("Fixed code", value=False)
+            H = st.number_input("H", min_value=64, max_value=1024, value=512)
+            W = st.number_input("W", min_value=64, max_value=1024, value=512)
 
-        st.form_submit_button()
+            C = st.number_input("C", min_value=1, max_value=32, value=4)
+            f = st.number_input("f", min_value=1, max_value=16, value=8)
+            scale = st.number_input("Scale", min_value=0.0, max_value=10.0, value=7.5)
 
-    precision_scope = autocast if opt.precision == "autocast" else nullcontext
-    with torch.no_grad(), precision_scope("cuda"), model.ema_scope():
-        gen_image_list = gen_images(
-            model,
-            f"{opt.config}-{opt.ckpt}",
-            prompt,
-            batch_size,
-            n_iter,
-            H,
-            W,
-            C,
-            f,
-            scale,
-            fixed_code,
-            opt.plms,
-            opt.cuda,
-            seed,
-        )
+            batch_size = st.number_input(
+                "Batch size", min_value=1, max_value=8, value=1
+            )
+            n_iter = st.number_input(
+                "Number of iterations", min_value=1, max_value=100, value=4
+            )
+            fixed_code = st.checkbox("Fixed code", value=False)
+
+            st.form_submit_button()
+
+        precision_scope = autocast if opt.precision == "autocast" else nullcontext
+        with torch.no_grad(), precision_scope("cuda"), model.ema_scope():
+            gen_image_list = gen_images(
+                model,
+                f"{opt.config}-{opt.ckpt}",
+                prompt,
+                batch_size,
+                n_iter,
+                H,
+                W,
+                C,
+                f,
+                scale,
+                fixed_code,
+                opt.plms,
+                opt.cuda,
+                seed,
+            )
+
+    elif option == "img2img":
+
+        with st.sidebar.form("Params"):
+            prompt = st.text_area(
+                "Prompt", "Boston is a beautiful, grand, historic, sensible city."
+            )
+            seed = st.number_input("Seed", min_value=0, max_value=1000000, value=42)
+
+            scale = st.number_input("Scale", min_value=0.0, max_value=10.0, value=7.5)
+
+            batch_size = st.number_input(
+                "Batch size", min_value=1, max_value=8, value=1
+            )
+            n_iter = st.number_input(
+                "Number of iterations", min_value=1, max_value=100, value=4
+            )
+
+            st.form_submit_button()
+
+        precision_scope = autocast if opt.precision == "autocast" else nullcontext
+        with torch.no_grad(), precision_scope("cuda"), model.ema_scope():
+            gen_image_list = gen_images_cond_image(
+                model,
+                f"{opt.config}-{opt.ckpt}",
+                prompt,
+                batch_size,
+                n_iter,
+                scale,
+                opt.plms,
+                opt.cuda,
+                seed,
+            )
 
     num_col = st.sidebar.number_input(
         "Number of columns", min_value=1, max_value=10, value=2
@@ -261,6 +395,20 @@ if __name__ == "__main__":
         action="store_true",
         help="use plms sampling",
     )
+
+    parser.add_argument(
+        "--init-img",
+        type=str,
+        default="./assets/stable-samples/img2img/sketch-mountains-input.jpg",
+        help="path to the input image",
+    )
+    parser.add_argument(
+        "--strength",
+        type=float,
+        default=0.75,
+        help="strength for noising/unnoising. 1.0 corresponds to full destruction of information in init image",
+    )
+
     parser.add_argument(
         "--laion400m",
         action="store_true",
