@@ -9,7 +9,6 @@
 
 """
 import argparse
-import os
 import typing as tp
 from contextlib import nullcontext
 from io import BytesIO
@@ -23,13 +22,6 @@ from joblib.memory import Memory
 from PIL import Image
 from torch import autocast
 from tqdm import tqdm, trange
-
-from diffusers.pipelines.stable_diffusion.safety_checker import (
-    StableDiffusionSafetyChecker,
-)
-from einops import repeat
-from omegaconf import OmegaConf
-from pytorch_lightning import seed_everything
 from transformers import AutoFeatureExtractor
 
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -313,13 +305,13 @@ def main(opt):
 
         with st.sidebar.form("Params"):
             prompt = st.text_area(
-                "Prompt", "Boston is a beautiful, grand, historic, sensible city."
+                "Prompt", "A fantasy landscape, trending on artstation"
             )
             seed = st.number_input("Seed", min_value=0, max_value=1000000, value=42)
 
             scale = st.number_input("Scale", min_value=0.0, max_value=10.0, value=7.5)
             strength = st.number_input(
-                "Strength", min_value=0.0, max_value=1.0, value=0.5
+                "Strength", min_value=0.0, max_value=1.0, value=0.75
             )
 
             batch_size = st.number_input(
@@ -336,7 +328,10 @@ def main(opt):
             image_option = st.selectbox("image option", image_option_list)
 
             if image_option == "path":
-                path = st.text_input("path", value="")
+                path = st.text_input(
+                    "path",
+                    value="./assets/stable-samples/img2img/sketch-mountains-input.jpg",
+                )
                 if not osp.exists(path):
                     st.error("File not found")
                     raise RuntimeError
@@ -346,9 +341,7 @@ def main(opt):
                 st.markdown(f"loaded input image of size ({w}, {h}) from {path}")
 
             elif image_option == "upload":
-                image = st.file_uploader(
-                    "upload image", type=["png", "jpg", "jpeg"]
-                )
+                image = st.file_uploader("upload image", type=["png", "jpg", "jpeg"])
                 if image is not None:
                     image = Image.open(image).convert("RGB")
                     w, h = image.size
@@ -356,7 +349,7 @@ def main(opt):
 
             # resize and pad to integer multiple of 32
             resize_ratio = st.number_input(
-                "resize ratio", min_value=0.0, max_value=1.0, value=0.5
+                "resize ratio", min_value=0.0, max_value=1.0, value=1.0
             )
             w, h = int(w * resize_ratio), int(h * resize_ratio)
             w, h = map(lambda x: x - x % 64, (w, h))
