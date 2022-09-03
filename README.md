@@ -1,6 +1,6 @@
 # Stable Diffusion :brain: + Streamlit :eyes:
 
-Mimimum code for Stable Diffusion web UI.
+Minimum code for Stable Diffusion web UI.
 
 ![screenshot](assets/streamlit_ui/screen_shot.png)
 
