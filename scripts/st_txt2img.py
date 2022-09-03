@@ -13,6 +13,7 @@ import os
 import typing as tp
 from contextlib import nullcontext
 from io import BytesIO
+from os import path as osp
 
 import numpy as np
 import PIL
@@ -177,35 +178,21 @@ def gen_images(
     return gen_image_list
 
 
-def load_img(path):
-    image = Image.open(path).convert("RGB")
-    w, h = image.size
-    print(f"loaded input image of size ({w}, {h}) from {path}")
-    w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
-
-    # NOTE(YL 09/02):: update this
-    w = w // 2
-    h = h // 2
-
-    image = image.resize((w, h), resample=PIL.Image.LANCZOS)
-    image = np.array(image).astype(np.float32) / 255.0
-    image = image[None].transpose(0, 3, 1, 2)
-    image = torch.from_numpy(image)
-    return 2.0 * image - 1.0
-
-
 @mem.cache(ignore=["model"])
 def gen_images_cond_image(
     model,
     model_hash: str,
+    original_image: np.ndarray,
     prompt: str,
     batch_size: int,
     n_iter: int,
+    strength: float,
     scale: float,
     plms: bool,
     cuda: str,
     seed: int,
 ) -> tp.List[np.ndarray]:
+    assert 0.0 <= strength <= 1.0, "can only work with strength in [0.0, 1.0]"
 
     seed_everything(seed)
 
@@ -219,9 +206,9 @@ def gen_images_cond_image(
 
     data = [batch_size * [prompt]]
 
-    assert os.path.isfile(opt.init_img)
-    init_image = load_img(opt.init_img).to(device)
-    print("init_image.shape: {}".format(init_image.shape))
+    original_image = original_image.astype(np.float32) / 255.0
+    original_image = original_image[None].transpose(0, 3, 1, 2)
+    init_image = torch.from_numpy(2.0 * original_image - 1).to(device)
     init_image = repeat(init_image, "1 ... -> b ...", b=batch_size)
     init_latent = model.get_first_stage_encoding(
         model.encode_first_stage(init_image)
@@ -231,8 +218,7 @@ def gen_images_cond_image(
         ddim_num_steps=opt.ddim_steps, ddim_eta=opt.ddim_eta, verbose=False
     )
 
-    assert 0.0 <= opt.strength <= 1.0, "can only work with strength in [0.0, 1.0]"
-    t_enc = int(opt.strength * opt.ddim_steps)
+    t_enc = int(strength * opt.ddim_steps)
     print(f"target t_enc is {t_enc} steps")
 
     gen_image_list = []
@@ -332,6 +318,9 @@ def main(opt):
             seed = st.number_input("Seed", min_value=0, max_value=1000000, value=42)
 
             scale = st.number_input("Scale", min_value=0.0, max_value=10.0, value=7.5)
+            strength = st.number_input(
+                "Strength", min_value=0.0, max_value=1.0, value=0.5
+            )
 
             batch_size = st.number_input(
                 "Batch size", min_value=1, max_value=8, value=1
@@ -342,14 +331,51 @@ def main(opt):
 
             st.form_submit_button()
 
+        with st.sidebar:
+            image_option_list = ["path", "upload"]
+            image_option = st.selectbox("image option", image_option_list)
+
+            if image_option == "path":
+                path = st.text_input("path", value="")
+                if not osp.exists(path):
+                    st.error("File not found")
+                    raise RuntimeError
+
+                image = Image.open(path).convert("RGB")
+                w, h = image.size
+                st.markdown(f"loaded input image of size ({w}, {h}) from {path}")
+
+            elif image_option == "upload":
+                image = st.file_uploader(
+                    "upload image", type=["png", "jpg", "jpeg"]
+                )
+                if image is not None:
+                    image = Image.open(image).convert("RGB")
+                    w, h = image.size
+                    st.markdown(f"uploaded input image of size ({w}, {h})")
+
+            # resize and pad to integer multiple of 32
+            resize_ratio = st.number_input(
+                "resize ratio", min_value=0.0, max_value=1.0, value=0.5
+            )
+            w, h = int(w * resize_ratio), int(h * resize_ratio)
+            w, h = map(lambda x: x - x % 64, (w, h))
+            image = image.resize((w, h), resample=PIL.Image.LANCZOS)
+
+            st.markdown(f"resized input image to ({w}, {h})")
+
+        st.image(image)
+
         precision_scope = autocast if opt.precision == "autocast" else nullcontext
         with torch.no_grad(), precision_scope("cuda"), model.ema_scope():
             gen_image_list = gen_images_cond_image(
                 model,
                 f"{opt.config}-{opt.ckpt}",
+                np.array(image),
                 prompt,
                 batch_size,
                 n_iter,
+                strength,
                 scale,
                 opt.plms,
                 opt.cuda,
@@ -402,13 +428,6 @@ if __name__ == "__main__":
         default="./assets/stable-samples/img2img/sketch-mountains-input.jpg",
         help="path to the input image",
     )
-    parser.add_argument(
-        "--strength",
-        type=float,
-        default=0.75,
-        help="strength for noising/unnoising. 1.0 corresponds to full destruction of information in init image",
-    )
-
     parser.add_argument(
         "--laion400m",
         action="store_true",
